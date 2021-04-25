@@ -33,8 +33,8 @@ with strategy.scope():
             
         
         def encoder_func(self, input_shape, custom_bottleneck_size = None):
-            input = Input(shape = input_shape)
-            layer = self.convLayer(input, 64) #128
+            inputx = Input(shape = input_shape)
+            layer = self.convLayer(inputx, 64) #128
             layer = self.convLayer(layer, 64) #64
             layer = self.convLayer(layer, 128) #32
             layer = self.convLayer(layer, 256) #16
@@ -43,19 +43,19 @@ with strategy.scope():
             layer = Flatten()(layer)
             if (custom_bottleneck_size == None):
                 # layer = Conv2D(filters = 16000, kernel_size = layer.shape[1], strides = layer.shape[2], padding = 'same', name = 'intermediate_conv')(layer)
-                layer = Dense(32000, dtype='float16')(layer)
+                layer = Dense(32000)(layer)
             else:
                 # layer = Conv2D(filters = custom_bottleneck_size, kernel_size = layer.shape[1], strides = layer.shape[2], padding = 'same', name = 'intermediate_conv')(layer)
-                layer = Dense(custom_bottleneck_size + custom_bottleneck_size, dtype='float16')(layer)
-            return Model(inputs = input, outputs = layer)
+                layer = Dense(custom_bottleneck_size + custom_bottleneck_size)(layer)
+            return Model(inputs = inputx, outputs = layer)
         
         
         def decoder_func(self, custom_bottleneck_size = None):
             if (custom_bottleneck_size == None):
-                input = Input(shape = 16000)
+                inputx = Input(shape = 16000)
             else:
-                input = Input(shape = custom_bottleneck_size)
-            layer = Dense(4*4*512)(input)
+                inputx = Input(shape = custom_bottleneck_size)
+            layer = Dense(4*4*512)(inputx)
             layer = Reshape(target_shape = (4, 4, 512))(layer)
             layer = self.deConvLayer(layer, 512) #8
             layer = self.deConvLayer(layer, 256) #16
@@ -63,7 +63,7 @@ with strategy.scope():
             layer = self.deConvLayer(layer, 64) #64
             layer = self.deConvLayer(layer, 16) #128
             layer = self.deConvLayer(layer, 3, is_last_layer = True) #256
-            model = Model(inputs = input, outputs = layer)
+            model = Model(inputs = inputx, outputs = layer)
             return model
         
         def encode(self, input, training = True):
@@ -79,7 +79,7 @@ with strategy.scope():
             return logits   
         
         def convLayer(self, input, filter_size):
-            padding = tf.constant([[0, 0], [1, 1], [1, 1], [0, 0]])
+            #padding = tf.constant([[0, 0], [1, 1], [1, 1], [0, 0]])
             # layer = tf.pad(input, padding, "CONSTANT")
             layer = input
             layer = Conv2D(filters = filter_size, kernel_size = 3, strides = 1, padding = 'same', use_bias=False)(layer)
@@ -100,8 +100,9 @@ with strategy.scope():
             layer = BatchNormalization()(layer)
             # layer = tf.pad(layer, padding, "CONSTANT")
             if (is_last_layer == True):
-                layer = Conv2DTranspose(filters = filter_size, kernel_size = 4, strides = 2, padding = 'same', dtype='float32')(layer)
-                layer = keras.activations.tanh(layer)
+                layer = Conv2DTranspose(filters = filter_size, kernel_size = 4, strides = 2, padding = 'same')(layer)
+                #layer = keras.activations.tanh(layer)
+                layer = keras.layers.Activation('tanh', dtype = 'float32')(layer)
                 # layer = BatchNormalization()(layer)
                 return layer
             layer = Conv2DTranspose(filters = filter_size, kernel_size = 4, strides = 2, padding = 'same', use_bias = False)(layer)
@@ -155,7 +156,8 @@ with strategy.scope():
             # layer = tf.pad(layer, padding, "CONSTANT")
             if (is_last_layer == True):
                 layer = Conv2DTranspose(filters = filter_size, kernel_size = 4, strides = 2, padding = 'same')(layer)
-                layer = keras.activations.tanh(layer)
+                #layer = keras.activations.tanh(layer)
+                layer = keras.layers.Activation('tanh', dtype = 'float32')(layer)
                 # layer = BatchNormalization()(layer)
                 return layer
             layer = Conv2DTranspose(filters = filter_size, kernel_size = 4, strides = 2, padding = 'same', use_bias = False)(layer)
