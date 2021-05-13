@@ -118,13 +118,14 @@ with strategy.scope():
             self.input_shape = input_shape
             self.custom_bottleneck_size = custom_bottleneck_size
             self.cross_entropy = keras.losses.BinaryCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
+            self.mse_loss = keras.losses.MeanSquaredError(reduction = tf.keras.losses.Reduction.NONE)
             self.learning_rate = 1e-4
             self.generator_optimizer = keras.optimizers.Adam(self.learning_rate)
             self.generator_optimizer = mixed_precision.LossScaleOptimizer(self.generator_optimizer)
             self.discriminator_optimizer = keras.optimizers.Adam(self.learning_rate)
             self.discriminator_optimizer = mixed_precision.LossScaleOptimizer(self.discriminator_optimizer)
-            self.encoder_optimizer = keras.optimizers.Adam(self.learning_rate)
-            self.encoder_optimizer = mixed_precision.LossScaleOptimizer(self.encoder_optimizer)
+            # self.encoder_optimizer = keras.optimizers.Adam(self.learning_rate)
+            # self.encoder_optimizer = mixed_precision.LossScaleOptimizer(self.encoder_optimizer)
             self.batch_size = 16
             self.epochs = 100
             self.loss_weight = 0.2
@@ -134,7 +135,7 @@ with strategy.scope():
             self.checkpoint_prefix = os.path.join(self.checkpoint_dir, "ckpt" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
             self.checkpoint = tf.train.Checkpoint(generator_optimizer = self.generator_optimizer, 
                                                 discriminator_optimizer = self.discriminator_optimizer,
-                                                encoder_optimizer = self.encoder_optimizer, 
+                                                # encoder_optimizer = self.encoder_optimizer, 
                                                 encoder = self.model.encoder,
                                                 decoder = self.model.decoder, 
                                                 discriminator = self.discriminator)
@@ -210,17 +211,19 @@ with strategy.scope():
                 else:
                     model.add(layer)
             model.add(Flatten())
-            model.add(Dense(1))
-            model.add(Activation('softmax', dtype = 'float32'))
+            model.add(Dense(1, dtype = 'float32'))
+            # model.add(Activation('sigmoid', dtype = 'float32'))
             return model
         
         def discriminatorLoss(self, real_output, fake_output):
             real_loss = self.cross_entropy(tf.ones_like(real_output), real_output)
+            # real_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits = real_output, labels = tf.ones_like(real_output))
             real_loss = tf.reduce_sum(real_loss) * (1. / self.batch_size)
-            fake_loss = self.cross_entropy(tf.ones_like(fake_output), fake_output)
-            real_loss = tf.reduce_sum(fake_loss) * (1. / self.batch_size)
+            fake_loss = self.cross_entropy(tf.zeros_like(fake_output), fake_output)
+            # fake_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits = fake_output, labels = tf.zeros_like(fake_output))
+            fake_loss = tf.reduce_sum(fake_loss) * (1. / self.batch_size)
             total_loss = real_loss + fake_loss
-            return total_loss
+            return tf.reduce_mean(total_loss)
         
         def log_normal_pdf(sample, mean, logvar, raxis=1):
             #print("TYPES:")
@@ -235,30 +238,56 @@ with strategy.scope():
         #    mse_loss = tf.keras.losses.MSE(images, generated_images)
         #    return mse_loss
         
-        def GaussianKLD(self, mu1, lv1, mu2, lv2):
-            v1 = tf.exp(lv1)
-            v2 = tf.exp(lv2)
-            mu_diff_sq = tf.square(mu1 - mu2)
-            dimwise_kld = .5 * ((lv2 - lv1) + tf.divide(v1, v2) + tf.divide(mu_diff_sq, v2) - 1.)
-            return tf.reduce_sum(dimwise_kld, -1)  
+        # def GaussianKLD(self, mu1, lv1, mu2, lv2):
+        #     v1 = tf.exp(lv1)
+        #     v2 = tf.exp(lv2)
+        #     mu_diff_sq = tf.square(mu1 - mu2)
+        #     dimwise_kld = .5 * ((lv2 - lv1) + tf.divide(v1, v2) + tf.divide(mu_diff_sq, v2) - 1.)
+        #     return tf.reduce_sum(dimwise_kld)
         
-        def generatorLoss(self, fake_output, images, generated_images, mean, logvar):
-            #1. Discriminator Loss
-            loss_D = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(fake_output, tf.ones_like(fake_output)))
-            #2. KLD Loss
-            # loss_KL = tf.reduce_mean(tf.reduce_mean(.5 * ((0 - logvar) + tf.divide(tf.exp(logvar), tf.exp(0)) + tf.divide(tf.square(mean), tf.exp(0)) - 1.), -1.))
-            loss_KL = self.GaussianKLD(mean, logvar, tf.zeros_like(mean), tf.zeros_like(logvar))
-            #3. MSE Loss
-            loss_mse = tf.reduce_sum(tf.keras.losses.mean_squared_error(images, generated_images), [1, 2])
+        # def generatorLoss(self, fake_output, images, generated_images, mean, logvar):
+        #     #1. Discriminator Loss
+        #     loss_D = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(fake_output, tf.ones_like(fake_output)))
+        #     # print(f"Loss D: {loss_D}")
+        #     #2. KLD Loss
+        #     # loss_KL = tf.reduce_mean(tf.reduce_mean(.5 * ((0 - logvar) + tf.divide(tf.exp(logvar), tf.exp(0)) + tf.divide(tf.square(mean), tf.exp(0)) - 1.), -1.))
+        #     loss_KL = self.GaussianKLD(mean, logvar, tf.zeros_like(mean), tf.zeros_like(logvar))/(images.shape[1] * images.shape[2] * images.shape[3])
+        #     #3. MSE Loss
+        #     loss_mse = tf.reduce_mean(tf.square(images - generated_images))
+        #     # print(f"Loss MSE: {loss_mse}")
+        #     overall_loss = loss_D*self.loss_weight + loss_mse*(1 - self.loss_weight)
             
-            overall_loss = loss_D*self.loss_weight + loss_mse*(1 - self.loss_weight)
+        #     return overall_loss, loss_KL 
+        
+        def generatorLoss(self, fake_output, images, generated_images, mean, logvar, bt_neck):
             
-            return overall_loss, loss_KL 
+            ce_loss = self.cross_entropy(tf.ones_like(fake_output), fake_output)
+            # ce_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits = fake_output, labels = tf.ones_like(fake_output))
+            ce_loss = tf.reduce_sum(ce_loss) * (1. / self.batch_size)
+            # ce_loss = 0
+            
+            images = tf.expand_dims(images, axis = -1)
+            generated_images = tf.expand_dims(generated_images, axis = -1)
+            
+            mse_loss = self.mse_loss(images, generated_images)
+            # print("mse_loss shape: ", mse_loss.shape)
+            # print("images shape: ", images.shape)
+            # mse_loss = tf.reduce_sum(mse_loss) * (1. /(self.batch_size))
+            # mse_loss = tf.nn.compute_average_loss(mse_loss, self.batch_size)
+            # mse_loss = tf.reduce_sum(mse_loss, axis=0)
+            mse_loss = tf.reduce_sum(mse_loss)
+            mse_loss /= tf.cast(tf.reduce_prod(tf.shape(images)[1:]), tf.float32)
+            # mse_loss = tf.reduce_sum(mse_loss)
+            print("ce loss shape: ", ce_loss.shape)
+            print("mse loss shape: ", mse_loss.shape)
+            # return ce_loss
+            return self.loss_weight*ce_loss + (1 - self.loss_weight)*mse_loss, ce_loss, mse_loss
+            # return mse_loss
         
         # def generatorLoss(self, fake_output, images, generated_images, mean, logvar, bt_neck):
-        #     mean = tf.cast(mean, dtype= tf.float32)
-        #     logvar = tf.cast(logvar, dtype= tf.float32)
-        #     bt_neck = tf.cast(bt_neck, dtype = tf.float32)
+        #     # mean = tf.cast(mean, dtype= tf.float32)
+        #     # logvar = tf.cast(logvar, dtype= tf.float32)
+        #     # bt_neck = tf.cast(bt_neck, dtype = tf.float32)
         #     cross_ent = tf.nn.sigmoid_cross_entropy_with_logits(logits=generated_images, labels=images)
         #     logpx_z = -tf.reduce_sum(cross_ent, axis=[1, 2, 3])
         #     #print(type(bt_neck))
@@ -269,7 +298,7 @@ with strategy.scope():
         #     logpz = tf.reduce_sum(-.5 * ((bt_neck - 0.) ** 2. * tf.exp(0.) + 0. + log2pi), axis = 1)
         #     logqz_x = tf.reduce_sum(-.5 * ((bt_neck - mean) ** 2. * tf.exp(-logvar) + logvar + log2pi), axis = 1)
             
-        #     mse_loss = tf.keras.losses.mean_squared_error(images, generated_images)
+        #     mse_loss = tf.reduce_mean(tf.square(images - generated_images))
             
         #     return (-tf.reduce_mean(logpx_z + logpz - logqz_x))*self.loss_weight + mse_loss*(1-self.loss_weight)
         
@@ -298,43 +327,44 @@ with strategy.scope():
 
         @tf.function  
         def train_step(self, images):
-            with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape, tf.GradientTape() as encoder_tape:
+            with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
                 # generated_images = self.generator(images, training = True)
                 mean, logvar = self.model.encode(images)
-                mean_copy = tf.identity(mean)
-                logvar_copy = tf.identity(logvar)
+                # mean_copy = tf.identity(mean)
+                # logvar_copy = tf.identity(logvar)
                 bt_neck = self.model.reparameterize(mean, logvar)
                 #print(f"bt_neck type: {type(bt_neck)}")
-                bt_neck_copy = tf.identity(bt_neck)
+                # bt_neck_copy = tf.identity(bt_neck)
                 generated_images = self.model.decode(bt_neck)
                 
                 real_output = self.discriminator(images, training = True)
                 fake_output = self.discriminator(generated_images, training = True)
                 
-                gen_loss, encoder_loss = self.generatorLoss(fake_output, images, generated_images, mean, logvar)
+                # gen_loss, encoder_loss = self.generatorLoss(fake_output, images, generated_images, mean, logvar)
+                gen_loss, ce_loss, mse_loss = self.generatorLoss(fake_output, images, generated_images, mean, logvar, bt_neck)
                 #gen_loss = self.generatorLoss(fake_output, images, generated_images, mean, logvar, z)
                 disc_loss = self.discriminatorLoss(real_output, fake_output)
                 
                 gen_loss_ori = gen_loss
-                encoder_loss_ori = encoder_loss
+                # encoder_loss_ori = encoder_loss
                 disc_loss_ori = disc_loss
                 
                 gen_loss = self.generator_optimizer.get_scaled_loss(gen_loss)
                 disc_loss = self.discriminator_optimizer.get_scaled_loss(disc_loss)
-                encoder_loss = self.encoder_optimizer.get_scaled_loss(encoder_loss)
+                # encoder_loss = self.encoder_optimizer.get_scaled_loss(encoder_loss)
                 
             gradients_of_generator = gen_tape.gradient(gen_loss, self.model.trainable_variables)
             gradients_of_discriminator = disc_tape.gradient(disc_loss, self.discriminator.trainable_variables)
-            gradients_of_encoder = encoder_tape.gradient(encoder_loss, self.model.encoder.trainable_variables)
+            # gradients_of_encoder = encoder_tape.gradient(encoder_loss, self.model.encoder.trainable_variables)
             
             gradients_of_generator = self.generator_optimizer.get_unscaled_gradients(gradients_of_generator)
             gradients_of_discriminator = self.discriminator_optimizer.get_unscaled_gradients(gradients_of_discriminator)
-            gradients_of_encoder = self.encoder_optimizer.get_unscaled_gradients(gradients_of_encoder)
+            # gradients_of_encoder = self.encoder_optimizer.get_unscaled_gradients(gradients_of_encoder)
             
             self.generator_optimizer.apply_gradients(zip(gradients_of_generator, self.model.trainable_variables))
             self.discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, self.discriminator.trainable_variables))
-            self.encoder_optimizer.apply_gradients(zip(gradients_of_encoder, self.model.encoder.trainable_variables))
-            return gen_loss_ori, disc_loss_ori, encoder_loss_ori
+            # self.encoder_optimizer.apply_gradients(zip(gradients_of_encoder, self.model.encoder.trainable_variables))
+            return gen_loss_ori, disc_loss_ori, ce_loss, mse_loss
             
         """
         CHANGES:
@@ -352,20 +382,20 @@ with strategy.scope():
                 print(f"Epoch {epoch + 1}", flush = True)
                 start = time.time()
                 for i in range(train_batch_count):
-                    gen_loss_values, disc_loss_values, encoder_loss_values = self.train_step(dataset.__getitem__(i))
+                    gen_loss_values, disc_loss_values, ce_loss, mse_loss = self.train_step(dataset.__getitem__(i))
                     if (i % 1000 == 0):
                         print(f"This Batch {i+1} Completed.")
-                        print(gen_loss_values, disc_loss_values, encoder_loss_values)
+                        print(gen_loss_values, disc_loss_values, ce_loss, mse_loss)
                     with self.train_summary_writer.as_default():
                         tf.summary.scalar("Batch Generator Loss", np.mean(gen_loss_values), step = epoch*train_batch_count + i)
                         tf.summary.scalar("Batch Discriminator Loss", np.mean(disc_loss_values), step = epoch*train_batch_count + i)
-                        tf.summary.scalar("Batch Encoder Loss", np.mean(encoder_loss_values), step = epoch*train_batch_count + i)
+                        # tf.summary.scalar("Batch Encoder Loss", np.mean(encoder_loss_values), step = epoch*train_batch_count + i)
                         self.train_summary_writer.flush()
                         # tf.summary.image("Batch Predicted Image", np.expand_dims(pred_image, axis = 0), step = epoch*train_batch_count + i)
                         # tf.summary.image("Batch Actual Image", np.expand_dims(act_image, axis = 0), step = epoch*train_batch_count + i)
                         
-                    if (i %100 == 0):
-                        pred_image, act_image = self.generate_and_save_images(self.model, epoch + 1, test_data.__getitem__(0))
+                    # if (i %100 == 0):
+                    #     pred_image, act_image = self.generate_and_save_images(self.model, epoch + 1, test_data.__getitem__(0))
                         
                 pred_image, act_image = self.generate_and_save_images(self.model, 
                                                                       epoch + 1, 
@@ -373,7 +403,7 @@ with strategy.scope():
                 with self.train_summary_writer.as_default():
                     tf.summary.scalar("Epoch Generator Loss", np.mean(gen_loss_values), step = epoch*train_batch_count + i)
                     tf.summary.scalar("Epoch Discriminator Loss", np.mean(disc_loss_values), step = epoch*train_batch_count + i)
-                    tf.summary.scalar("Epoch Encoder Loss", np.mean(encoder_loss_values), step = epoch*train_batch_count + i)
+                    # tf.summary.scalar("Epoch Encoder Loss", np.mean(encoder_loss_values), step = epoch*train_batch_count + i)
                     self.train_summary_writer.flush()
                     
                 self.checkpoint.save(file_prefix = self.checkpoint_prefix + str(epoch + 1))
@@ -486,7 +516,7 @@ with strategy.scope():
                 self.checkpoint_prefix = os.path.join(self.checkpoint_dir, "ckpt" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
                 self.checkpoint = tf.train.Checkpoint(generator_optimizer = self.generator_optimizer, 
                                                       discriminator_optimizer = self.discriminator_optimizer, 
-                                                      encoder_optimizer = self.encoder_optimizer,
+                                                    #   encoder_optimizer = self.encoder_optimizer,
                                                       encoder = self.model.encoder, 
                                                       decoder = self.model.decoder, 
                                                       discriminator = self.discriminator)
@@ -503,12 +533,11 @@ with strategy.scope():
         def load_model_checkpoint(self, checkpoint_path):
             self.checkpoint.restore(checkpoint_path)
         
-        #def load_model_tensorboard(tensorboard_path):
-            
-        
         def printModelSummary(self):
             print("------------------------------------------------GENERATOR NETWORK------------------------------------------------")
             print(self.generator.summary())
             print("------------------------------------------------DISCRIMINATOR NETWORK------------------------------------------------")
             print(self.discriminator.summary())
             
+
+
