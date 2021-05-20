@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import Sequential, Model, Input
-from tensorflow.keras.layers import Conv2D, Dense, BatchNormalization, Conv2DTranspose, LeakyReLU, InputLayer, Flatten, Reshape, Activation
+from tensorflow.keras.layers import Conv2D, Dense, BatchNormalization, Conv2DTranspose, LeakyReLU, InputLayer, Flatten, Reshape, Activation, Dropout
 from tensorflow.keras.applications.vgg19 import VGG19
 from tensorflow.keras import metrics, backend as K
 import time
@@ -17,12 +17,12 @@ import random
 import cv2 as cv
 import datetime
 from tensorflow.keras import mixed_precision
+from tensorflow.python.ops import math_ops
 
 mixed_precision.set_global_policy('mixed_float16')
 
 strategy = tf.distribute.MirroredStrategy()
 with strategy.scope():
-    
     class CVAE(tf.keras.Model):
         def __init__(self, input_shape, latent_dim = None):
             super(CVAE, self).__init__()
@@ -55,7 +55,8 @@ with strategy.scope():
                 inputx = Input(shape = (8000, ))
             else:
                 inputx = Input(shape = (custom_bottleneck_size, ))
-            layer = Dense(4*4*512, activation = 'relu')(inputx)
+            layer = Dense(4*4*512)(inputx)
+            layer = LeakyReLU()(layer)
             layer = Reshape(target_shape = (4, 4, 512))(layer)
             layer = self.deConvLayer(layer, 512) #8
             layer = self.deConvLayer(layer, 256) #16
@@ -117,12 +118,15 @@ with strategy.scope():
         def __init__(self, input_shape, custom_bottleneck_size = None):
             self.input_shape = input_shape
             self.custom_bottleneck_size = custom_bottleneck_size
+            #self.cross_entropy = keras.losses.BinaryCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE, label_smoothing = 0.1)
             self.cross_entropy = keras.losses.BinaryCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
             self.mse_loss = keras.losses.MeanSquaredError(reduction = tf.keras.losses.Reduction.NONE)
             self.learning_rate = 1e-4
-            self.generator_optimizer = keras.optimizers.Adam(self.learning_rate)
+            self.generator_optimizer = keras.optimizers.Adam(self.learning_rate, epsilon=1e-04)
+            # self.generator_optimizer = keras.optimizers.SGD(self.learning_rate)
             self.generator_optimizer = mixed_precision.LossScaleOptimizer(self.generator_optimizer)
-            self.discriminator_optimizer = keras.optimizers.Adam(self.learning_rate)
+            self.discriminator_optimizer = keras.optimizers.Adam(self.learning_rate, epsilon=1e-04)
+            # self.discriminator_optimizer = keras.optimizers.SGD(self.learning_rate)
             self.discriminator_optimizer = mixed_precision.LossScaleOptimizer(self.discriminator_optimizer)
             # self.encoder_optimizer = keras.optimizers.Adam(self.learning_rate)
             # self.encoder_optimizer = mixed_precision.LossScaleOptimizer(self.encoder_optimizer)
@@ -208,6 +212,7 @@ with strategy.scope():
                 if ('conv' in layer.name):
                     model.add(layer)
                     model.add(BatchNormalization())
+                    model.add(Dropout(0.2))
                 else:
                     model.add(layer)
             model.add(Flatten())
@@ -259,30 +264,66 @@ with strategy.scope():
             
         #     return overall_loss, loss_KL 
         
-        def generatorLoss(self, fake_output, images, generated_images, mean, logvar, bt_neck):
+        # def generatorLoss(self, fake_output, images, generated_images, mean, logvar, bt_neck): #LATEST LOSS FUNCTION
+        #     ce_loss = self.cross_entropy(tf.ones_like(fake_output), fake_output)
+        #     ce_loss = tf.reduce_sum(ce_loss) * (1. / self.batch_size)
             
+        #     images = tf.expand_dims(images, axis = -1)
+        #     generated_images = tf.expand_dims(generated_images, axis = -1)
+            
+        #     mse_loss = K.mean(math_ops.squared_difference(generated_images, images))
+            
+        #     return self.loss_weight*ce_loss + (1 - self.loss_weight)*mse_loss, ce_loss, mse_loss, 0
+        
+        def generatorLoss(self, fake_output, images, generated_images, mean, logvar, bt_neck, epoch): #SIMPLE LOSS
             ce_loss = self.cross_entropy(tf.ones_like(fake_output), fake_output)
-            # ce_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits = fake_output, labels = tf.ones_like(fake_output))
             ce_loss = tf.reduce_sum(ce_loss) * (1. / self.batch_size)
-            # ce_loss = 0
             
             images = tf.expand_dims(images, axis = -1)
             generated_images = tf.expand_dims(generated_images, axis = -1)
             
             mse_loss = self.mse_loss(images, generated_images)
-            # print("mse_loss shape: ", mse_loss.shape)
-            # print("images shape: ", images.shape)
-            # mse_loss = tf.reduce_sum(mse_loss) * (1. /(self.batch_size))
-            # mse_loss = tf.nn.compute_average_loss(mse_loss, self.batch_size)
-            # mse_loss = tf.reduce_sum(mse_loss, axis=0)
             mse_loss = tf.reduce_sum(mse_loss)
-            mse_loss /= tf.cast(tf.reduce_prod(tf.shape(images)[1:]), tf.float32)
-            # mse_loss = tf.reduce_sum(mse_loss)
-            print("ce loss shape: ", ce_loss.shape)
-            print("mse loss shape: ", mse_loss.shape)
-            # return ce_loss
-            return self.loss_weight*ce_loss + (1 - self.loss_weight)*mse_loss, ce_loss, mse_loss
-            # return mse_loss
+            mse_loss /= tf.cast(tf.reduce_prod(tf.shape(images)), tf.float32)
+            
+            #if (epoch < 3):
+            #    print("0.2 epoch")
+            #    return 0.2*ce_loss + (0.8)*mse_loss, tf.reduce_mean(ce_loss), tf.reduce_mean(mse_loss), 0
+            #elif (epoch < 10):
+            #    return 0.4*ce_loss + (0.6)*mse_loss, tf.reduce_mean(ce_loss), tf.reduce_mean(mse_loss), 0
+            #    print("0.4 epoch")
+            #elif (epoch < 15):
+            #    return 0.6*ce_loss + (0.4)*mse_loss, tf.reduce_mean(ce_loss), tf.reduce_mean(mse_loss), 0
+            #    print("0.6 epoch")    
+            
+            return tf.cast(self.loss_weight*ce_loss + (1 - self.loss_weight)*mse_loss, tf.float32), tf.reduce_mean(ce_loss), tf.reduce_mean(mse_loss), 0
+            
+        
+        # def generatorLoss(self, fake_output, images, generated_images, mean, logvar, bt_neck): #LAST LOSS FUNCTION
+            
+        #     ce_loss = self.cross_entropy(tf.ones_like(fake_output), fake_output)
+        #     # ce_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits = fake_output, labels = tf.ones_like(fake_output))
+        #     ce_loss = tf.reduce_sum(ce_loss) * (1. / self.batch_size)
+        #     # ce_loss = 0
+            
+        #     images = tf.expand_dims(images, axis = -1)
+        #     generated_images = tf.expand_dims(generated_images, axis = -1)
+            
+        #     mse_loss = self.mse_loss(images, generated_images)
+        #     # print("mse_loss shape: ", mse_loss.shape)
+        #     # print("images shape: ", images.shape)
+        #     # mse_loss = tf.reduce_sum(mse_loss) * (1. /(self.batch_size))
+        #     # mse_loss = tf.nn.compute_average_loss(mse_loss, self.batch_size)
+        #     # mse_loss = tf.reduce_sum(mse_loss, axis=0)
+        #     mse_loss = tf.reduce_sum(mse_loss)
+        #     mse_before = mse_loss
+        #     mse_loss /= tf.cast(tf.reduce_prod(tf.shape(images)[1:]), tf.float32)
+        #     # mse_loss = tf.reduce_sum(mse_loss)
+        #     print("ce loss shape: ", ce_loss.shape)
+        #     print("mse loss shape: ", mse_loss.shape)
+        #     # return ce_loss
+        #     return self.loss_weight*ce_loss + (1 - self.loss_weight)*mse_loss, ce_loss, mse_loss, mse_before
+        #     # return mse_loss
         
         # def generatorLoss(self, fake_output, images, generated_images, mean, logvar, bt_neck):
         #     # mean = tf.cast(mean, dtype= tf.float32)
@@ -319,14 +360,14 @@ with strategy.scope():
         #    #print(ce_loss.shape)
         #    
         #    total_loss = self.loss_weight*ce_loss + (1 - self.loss_weight)*mse_loss
-        #    return total_loss
+        #    return total_loss 
 
         def createNetwork(self):
             self.generator = self.createGenerator(self.input_shape, self.custom_bottleneck_size)
             self.discriminator = self.createDiscriminator(self.input_shape)
 
         @tf.function  
-        def train_step(self, images):
+        def train_step(self, images, epoch):
             with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
                 # generated_images = self.generator(images, training = True)
                 mean, logvar = self.model.encode(images)
@@ -341,7 +382,7 @@ with strategy.scope():
                 fake_output = self.discriminator(generated_images, training = True)
                 
                 # gen_loss, encoder_loss = self.generatorLoss(fake_output, images, generated_images, mean, logvar)
-                gen_loss, ce_loss, mse_loss = self.generatorLoss(fake_output, images, generated_images, mean, logvar, bt_neck)
+                gen_loss, ce_loss, mse_loss, mse_before = self.generatorLoss(fake_output, images, generated_images, mean, logvar, bt_neck, epoch)
                 #gen_loss = self.generatorLoss(fake_output, images, generated_images, mean, logvar, z)
                 disc_loss = self.discriminatorLoss(real_output, fake_output)
                 
@@ -364,7 +405,7 @@ with strategy.scope():
             self.generator_optimizer.apply_gradients(zip(gradients_of_generator, self.model.trainable_variables))
             self.discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, self.discriminator.trainable_variables))
             # self.encoder_optimizer.apply_gradients(zip(gradients_of_encoder, self.model.encoder.trainable_variables))
-            return gen_loss_ori, disc_loss_ori, ce_loss, mse_loss
+            return gen_loss_ori, disc_loss_ori, ce_loss, mse_loss, mse_before
             
         """
         CHANGES:
@@ -382,10 +423,21 @@ with strategy.scope():
                 print(f"Epoch {epoch + 1}", flush = True)
                 start = time.time()
                 for i in range(train_batch_count):
-                    gen_loss_values, disc_loss_values, ce_loss, mse_loss = self.train_step(dataset.__getitem__(i))
+                    gen_loss_values, disc_loss_values, ce_loss, mse_loss, mse_before = self.train_step(dataset.__getitem__(i), epoch)
                     if (i % 1000 == 0):
-                        print(f"This Batch {i+1} Completed.")
-                        print(gen_loss_values, disc_loss_values, ce_loss, mse_loss)
+                        print(f"Batch {i+1} Completed.")
+                        # print(gen_loss_values, disc_loss_values, ce_loss, mse_loss, mse_before)
+                        print(f"Generated loss:     {gen_loss_values}")
+                        print(f"Discriminator Loss: {disc_loss_values}")
+                        print(f"Cross Entropy Loss: {ce_loss}")
+                        print(f"MSE Loss:           {mse_loss}")
+                        print(f"MSE Before:         {mse_before}")
+                        # print("")
+                        
+                        # pred_image, act_image = self.generate_and_save_images(self.model, 
+                        #                                               epoch + 1 + 200, 
+                        #                                               test_data.__getitem__(0))
+                        
                     with self.train_summary_writer.as_default():
                         tf.summary.scalar("Batch Generator Loss", np.mean(gen_loss_values), step = epoch*train_batch_count + i)
                         tf.summary.scalar("Batch Discriminator Loss", np.mean(disc_loss_values), step = epoch*train_batch_count + i)
@@ -408,6 +460,7 @@ with strategy.scope():
                     
                 self.checkpoint.save(file_prefix = self.checkpoint_prefix + str(epoch + 1))
                 print(f"Epoch Completed in: {time.time() - start} secs.")
+                print(" ")
 
         def generate_and_save_images(self, model, epoch, test_input):
             # predictions = model(test_input, training = False)
@@ -424,7 +477,7 @@ with strategy.scope():
                 pred_image = predictions[i]*127.5 + 127.5
                 act_image = test_input[i]*127.5 + 127.5
                 image = np.concatenate([act_image, pred_image], axis = 1)
-                cv.imwrite("./output/images3/image_{:03d}_{:02d}.png".format(epoch, i), image)
+                cv.imwrite("./output/images4/image_{:03d}_{:02d}.png".format(epoch, i), image)
                 
             return predictions, test_input
 
